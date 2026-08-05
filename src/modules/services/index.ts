@@ -10,35 +10,17 @@ import {
 } from "../../utils";
 
 import { ChatGPT, customGPT1, customGPT2, customGPT3, azureGPT } from "./gpt";
-import { BingDict } from "./bingdict";
-import { CambridgeDict } from "./cambridgedict";
 import { Claude } from "./claude";
-import { CollinsDict } from "./collinsdict";
-import { FreeDictionaryAPI } from "./freedictionaryapi";
 import { Gemini } from "./gemini";
-import { Haici } from "./haici";
-import { HaiciDict } from "./haicidict";
-import { GramotaDict } from "./gramotadict";
-import { WeblioDict } from "./webliodict";
-import { YoudaoDict } from "./youdaodict";
 
 const register: TranslateService[] = [
-  BingDict,
-  CambridgeDict,
   Claude,
-  CollinsDict,
-  FreeDictionaryAPI,
   Gemini,
-  GramotaDict,
   ChatGPT,
   customGPT1,
   customGPT2,
   customGPT3,
   azureGPT,
-  Haici,
-  HaiciDict,
-  WeblioDict,
-  YoudaoDict,
 ];
 
 export class TranslationServices {
