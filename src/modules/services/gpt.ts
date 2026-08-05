@@ -1,0 +1,516 @@
+import { getPref, getString, transformPromptWithContext } from "../../utils";
+import { TranslateService } from "./base";
+import {
+  buildSystemPrompt,
+  postProcessAbbreviationConsistency,
+  findMatchingAbbreviations,
+  loadCustomGlossary,
+  getPaperContext,
+  translationCache,
+  saveCache,
+} from "./medical-core";
+
+type ID = "chatgpt" | "customgpt1" | "customgpt2" | "customgpt3" | "azuregpt";
+
+function getCustomParams(prefix: string): Record<string, any> {
+  const storedCustomParams =
+    (getPref(`${prefix}.customParams`) as string) || "{}";
+  try {
+    const customParams = JSON.parse(storedCustomParams);
+    // Filter out parameters that are already defined (for both Chat Completions and Responses API)
+    const standardParams = [
+      "model",
+      "messages",
+      "input",
+      "temperature",
+      "stream",
+    ];
+    return Object.fromEntries(
+      Object.entries(customParams).filter(
+        ([key]) => !standardParams.includes(key),
+      ),
+    );
+  } catch (e) {
+    return {};
+  }
+}
+
+interface ParsedResponse {
+  content: string;
+  finished: boolean;
+}
+
+/**
+ * Detect if the endpoint URL is for OpenAI Responses API
+ */
+function isResponsesApiEndpoint(url: string): boolean {
+  return url.endsWith("/responses") || url.includes("/responses?");
+}
+
+/**
+ * Parse streaming response for OpenAI Responses API
+ * Event format: { "type": "response.output_text.delta", "delta": "text", ... }
+ */
+function parseResponsesApiStreamResponse(obj: any): ParsedResponse {
+  const eventType = obj.type || "";
+
+  // Text delta event - this is the main event for streaming text
+  // Format: { "type": "response.output_text.delta", "delta": "In", ... }
+  if (eventType === "response.output_text.delta") {
+    return {
+      content: obj.delta || "",
+      finished: false,
+    };
+  }
+
+  // Completion events
+  if (
+    eventType === "response.completed" ||
+    eventType === "response.done" ||
+    eventType === "response.failed" ||
+    eventType === "response.incomplete"
+  ) {
+    return {
+      content: "",
+      finished: true,
+    };
+  }
+
+  // Other events we don't need to extract content from:
+  // response.created, response.in_progress, response.output_item.added,
+  // response.content_part.added, response.output_text.done, etc.
+  return { content: "", finished: false };
+}
+
+/**
+ * Parse non-streaming response for OpenAI Responses API
+ * Response format: { output: [{ type: "message", content: [{ type: "output_text", text: "..." }] }] }
+ */
+function parseResponsesApiNonStreamResponse(obj: any): string {
+  if (obj.output && Array.isArray(obj.output)) {
+    for (const item of obj.output) {
+      if (item.type === "message" && item.content) {
+        for (const content of item.content) {
+          if (content.type === "output_text") {
+            return content.text || "";
+          }
+        }
+      }
+    }
+  }
+  return "";
+}
+
+function parseStreamResponse(obj: any): ParsedResponse {
+  // Handle OpenAI format (choices array with delta)
+  if (obj.choices && obj.choices[0]) {
+    const choice = obj.choices[0];
+    return {
+      content: choice.delta?.content || "",
+      finished:
+        choice.finish_reason !== undefined && choice.finish_reason !== null,
+    };
+  }
+  // Handle Ollama native format (direct message)
+  else if (obj.message) {
+    return {
+      content: obj.message.content || "",
+      finished: obj.done === true,
+    };
+  }
+  return { content: "", finished: false };
+}
+
+function parseNonStreamResponse(obj: any): string {
+  // Handle OpenAI format (choices array)
+  if (obj.choices && obj.choices[0]) {
+    return obj.choices[0].message.content || "";
+  }
+  // Handle Ollama native format (direct message)
+  else if (obj.message && obj.message.content) {
+    return obj.message.content;
+  }
+  return "";
+}
+
+const gptTranslate = async function (
+  apiURL: string,
+  model: string,
+  temperature: number,
+  prefix: string,
+  data: Parameters<TranslateService["translate"]>[0],
+  stream?: boolean,
+) {
+  // === 医学翻译增强：缓存检查 ===
+  const cacheKey = `${data.raw}|${data.langfrom || "en"}|${data.langto || "zh-CN"}|${model}`;
+  const cached = translationCache.get(cacheKey);
+  if (cached) {
+    cached.timestamp = Date.now();
+    data.result = cached.result;
+    data.status = "success";
+    return;
+  }
+
+  const paperContext = getPaperContext(data.itemId);
+  const customGlossary = loadCustomGlossary();
+  const customPrompt = (getPref(`${prefix}.prompt`) as string) || "";
+
+  function buildMedicalMessages(): Array<{ role: string; content: string }> {
+    const systemPrompt = buildSystemPrompt(data.raw, paperContext, customGlossary);
+    return [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: `请翻译以下英文医学文献段落：\n\n${data.raw}` },
+    ];
+  }
+
+  function buildCustomUserContent(): string {
+    return transformPromptWithContext(
+      `${prefix}.prompt`,
+      data.langfrom,
+      data.langto,
+      data.raw,
+      data,
+    );
+  }
+
+  const streamMode = stream ?? true;
+  const useResponsesApi = isResponsesApiEndpoint(apiURL);
+
+  const refreshHandler = addon.api.getTemporaryRefreshHandler({ task: data });
+
+  //It takes some time to translate, so set the text to "Translating" before the request
+  if (streamMode === false) {
+    data.result = getString("status-translating");
+    refreshHandler();
+  }
+
+  /**
+   * The requestObserver callback, under streaming mode
+   * @param xmlhttp
+   */
+  const streamCallback = (xmlhttp: XMLHttpRequest) => {
+    let preLength = 0;
+    let result = "";
+    let buffer = ""; // Buffer to store incomplete JSON fragments
+    xmlhttp.onprogress = (e: any) => {
+      // Only concatenate the new strings
+      const newResponse = e.target.response.slice(preLength);
+
+      // Handle both OpenAI SSE format and Ollama native streaming
+      let dataArray;
+      const hasSseData = /(^|\n)data:/.test(newResponse);
+      if (hasSseData) {
+        // OpenAI SSE format
+        // Prepend buffer from previous incomplete chunk
+        const fullResponse = buffer + newResponse;
+        if (useResponsesApi) {
+          // Responses API has "event:" lines, need line-by-line parsing
+          dataArray = fullResponse
+            .split("\n")
+            .filter((line: string) => line.startsWith("data:"))
+            .map((line: string) => line.slice(5).trimStart());
+        } else {
+          // Chat Completions format: simple split works
+          dataArray = fullResponse.split("data:");
+        }
+        buffer = ""; // Reset buffer
+      } else {
+        // Ollama native format - each line is a JSON object
+        const fullResponse = buffer + newResponse;
+        dataArray = fullResponse
+          .split("\n")
+          .filter((line: string) => line.trim());
+        buffer = ""; // Reset buffer
+      }
+
+      for (let i = 0; i < dataArray.length; i++) {
+        const data = dataArray[i];
+        if (!data.trim()) continue;
+
+        try {
+          const obj = JSON.parse(data);
+          const { content, finished } = useResponsesApi
+            ? parseResponsesApiStreamResponse(obj)
+            : parseStreamResponse(obj);
+
+          result += content;
+          if (finished) {
+            break;
+          }
+        } catch {
+          // If parsing fails and this is the last item, it might be incomplete
+          // Save it to buffer for next iteration
+          // https://github.com/windingwind/zotero-pdf-translate/issues/1304
+          if (i === dataArray.length - 1) {
+            buffer = hasSseData ? "data:" + data : data;
+          }
+          continue;
+        }
+      }
+
+      // Clear timeouts caused by stream transfers
+      if (e.target.timeout) {
+        e.target.timeout = 0;
+      }
+
+      // Remove \n\n from the beginning of the data
+      data.result = result.replace(/^\n\n/, "");
+      preLength = e.target.response.length;
+
+      refreshHandler();
+    };
+  };
+
+  /**
+   * The requestObserver callback, under non-streaming mode
+   * @param xmlhttp
+   */
+  const nonStreamCallback = (xmlhttp: XMLHttpRequest) => {
+    // Non-streaming logic: Handle the complete response at once
+    xmlhttp.onload = () => {
+      // console.debug("GPT response received");
+      try {
+        const responseObj = JSON.parse(xmlhttp.responseText);
+        const resultContent = useResponsesApi
+          ? parseResponsesApiNonStreamResponse(responseObj)
+          : parseNonStreamResponse(responseObj);
+        data.result = resultContent.replace(/^\n\n/, "");
+      } catch (error) {
+        // throw `Failed to parse response: ${error}`;
+        return;
+      }
+
+      // Trigger UI updates after receiving the full response
+      refreshHandler();
+    };
+  };
+
+  // Build request body based on API type
+  const requestBody = useResponsesApi
+    ? {
+        model: model,
+        input: customPrompt
+          ? buildCustomUserContent()
+          : buildMedicalMessages()
+              .map((m) => `${m.role}: ${m.content}`)
+              .join("\n\n"),
+        temperature: temperature,
+        stream: streamMode,
+        ...getCustomParams(prefix),
+      }
+    : {
+        model: model,
+        messages: customPrompt
+          ? [{ role: "user", content: buildCustomUserContent() }]
+          : buildMedicalMessages(),
+        temperature: temperature,
+        stream: streamMode,
+        ...getCustomParams(prefix),
+      };
+
+  const xhr = await Zotero.HTTP.request("POST", apiURL, {
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${data.secret}`,
+      "api-key": data.secret,
+    },
+    body: JSON.stringify(requestBody),
+    responseType: "text",
+    requestObserver: (xmlhttp: XMLHttpRequest) => {
+      if (streamMode) {
+        streamCallback(xmlhttp);
+      } else {
+        nonStreamCallback(xmlhttp);
+      }
+    },
+  });
+  if (xhr?.status !== 200) {
+    data.status = "fail";
+    throw `Request error: ${xhr?.status}`;
+  }
+
+  // === 医学翻译后处理 ===
+  if (!customPrompt) {
+    const matchedAbbrs = findMatchingAbbreviations(data.raw, paperContext);
+    data.result = postProcessAbbreviationConsistency(
+      data.result,
+      matchedAbbrs,
+      customGlossary,
+    );
+  }
+
+  // 缓存结果
+  data.status = "success";
+  translationCache.set(cacheKey, {
+    result: data.result,
+    timestamp: Date.now(),
+  });
+  saveCache(translationCache);
+};
+
+function createGPTService(id: ID): TranslateService {
+  const checkSecret = id === "azuregpt" || id === "chatgpt";
+
+  // For compatibility reasons, in older versions, the preference key was `chatGPT`, rather than matching the ID.
+  // Additionally, customGPT was not initialized in prefs.js.
+  const prefPrefix = id.replace("gpt", "GPT") as
+    | "chatGPT"
+    // | "customGPT1"
+    // | "customGPT2"
+    // | "customGPT3"
+    | "azureGPT";
+
+  return {
+    id,
+    type: "sentence",
+    helpUrl:
+      id === "azuregpt"
+        ? "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/reference#chat-completions"
+        : "https://gist.github.com/GrayXu/f1b72353b4b0493d51d47f0f7498b67b",
+
+    ...(checkSecret && {
+      defaultSecret: "",
+      secretValidator(secret: string) {
+        if (id === "chatgpt") {
+          const status = /^sk-[A-Za-z0-9_-]{32,}$/.test(secret);
+          const empty = secret.length === 0;
+          return {
+            secret,
+            status,
+            info: empty
+              ? "The secret is not set."
+              : status
+                ? "Click the button to check connectivity."
+                : "The secret key format is invalid.",
+          };
+        }
+
+        if (id === "azuregpt") {
+          const flag = Boolean(secret);
+          return {
+            secret,
+            status: flag,
+            info: flag ? "" : "The secret is not set.",
+          };
+        }
+
+        const status = secret.length > 0;
+        return {
+          secret,
+          status,
+          info: status
+            ? "Click the button to check connectivity."
+            : "The secret key format is invalid.",
+        };
+      },
+    }),
+
+    async translate(data) {
+      switch (id) {
+        case "azuregpt": {
+          const endPoint = getPref("azureGPT.endPoint") as string;
+          const apiVersion = getPref("azureGPT.apiVersion");
+          const model = getPref("azureGPT.model") as string;
+          const temperature = parseFloat(
+            getPref("azureGPT.temperature") as string,
+          );
+          const stream = getPref("azureGPT.stream") as boolean;
+
+          const apiURL = new URL(endPoint);
+          apiURL.pathname = `/openai/deployments/${model}/chat/completions`;
+          apiURL.search = `api-version=${apiVersion}`;
+
+          return await gptTranslate(
+            apiURL.href,
+            model,
+            temperature,
+            "azureGPT",
+            data,
+            stream,
+          );
+        }
+
+        case "chatgpt":
+        case "customgpt1":
+        case "customgpt2":
+        case "customgpt3": {
+          const apiURL = getPref(`${prefPrefix}.endPoint`) as string;
+          const model = getPref(`${prefPrefix}.model`) as string;
+          const temperature = parseFloat(
+            getPref(`${prefPrefix}.temperature`) as string,
+          );
+          const stream = getPref(`${prefPrefix}.stream`) as boolean;
+
+          return await gptTranslate(
+            apiURL,
+            model,
+            temperature,
+            prefPrefix,
+            data,
+            stream,
+          );
+        }
+
+        default:
+          break;
+      }
+    },
+
+    config(settings) {
+      const servicePrefix = id === "azuregpt" ? "azuregpt" : "chatgpt";
+
+      settings
+        .addTextSetting({
+          prefKey: `${prefPrefix}.endPoint`,
+          nameKey: `service-${servicePrefix}-dialog-endPoint`,
+        })
+        .addTextSetting({
+          prefKey: `${prefPrefix}.model`,
+          nameKey: `service-${servicePrefix}-dialog-model`,
+        })
+        .addNumberSetting({
+          prefKey: `${prefPrefix}.temperature`,
+          nameKey: `service-${servicePrefix}-dialog-temperature`,
+          min: 0,
+          max: 2,
+          step: 0.1,
+        });
+
+      if (
+        id === "azuregpt" &&
+        prefPrefix === "azureGPT" &&
+        servicePrefix === "azuregpt"
+      ) {
+        settings.addTextSetting({
+          prefKey: `${prefPrefix}.apiVersion`,
+          nameKey: `service-${servicePrefix}-dialog-apiVersion`,
+          hidden: id !== "azuregpt",
+        });
+      }
+
+      settings
+        .addTextAreaSetting({
+          prefKey: `${prefPrefix}.prompt`,
+          nameKey: `service-${servicePrefix}-dialog-prompt`,
+          placeholder: getString(`service-${servicePrefix}-dialog-prompt`),
+        })
+        .addCheckboxSetting({
+          prefKey: `${prefPrefix}.stream`,
+          nameKey: `service-${servicePrefix}-dialog-stream`,
+        })
+        .addCustomParamsSetting({
+          prefKey: `${prefPrefix}.customParams`,
+          nameKey: `service-${servicePrefix}-dialog-custom-request`,
+          desc: getString(
+            `service-${servicePrefix}-dialog-custom-request-description`,
+          ),
+        });
+    },
+  };
+}
+
+export const ChatGPT = createGPTService("chatgpt");
+export const customGPT1 = createGPTService("customgpt1");
+export const customGPT2 = createGPTService("customgpt2");
+export const customGPT3 = createGPTService("customgpt3");
+export const azureGPT = createGPTService("azuregpt");
