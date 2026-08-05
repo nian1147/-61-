@@ -47,7 +47,11 @@ const translate = <TranslateService["translate"]>async function (data) {
         data,
       );
     }
-    const systemPrompt = buildSystemPrompt(sourceText, paperContext, customGlossary);
+    const systemPrompt = buildSystemPrompt(
+      sourceText,
+      paperContext,
+      customGlossary,
+    );
     return `${systemPrompt}\n\n请翻译以下英文医学文献段落：\n\n${sourceText}`;
   }
 

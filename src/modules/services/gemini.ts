@@ -13,7 +13,7 @@ import {
 
 const translate = <TranslateService["translate"]>async function (data) {
   const apiURL = getPref("gemini.endPoint") as string;
-  const model = getPref("gemini.model") as string || "gemini-2.5-flash-lite";
+  const model = (getPref("gemini.model") as string) || "gemini-2.5-flash-lite";
 
   // === 医学翻译增强：缓存检查 ===
   const cacheKey = `${data.raw}|${data.langfrom || "en"}|${data.langto || "zh-CN"}|${model}`;
@@ -43,7 +43,11 @@ const translate = <TranslateService["translate"]>async function (data) {
         data,
       );
     }
-    const systemPrompt = buildSystemPrompt(sourceText, paperContext, customGlossary);
+    const systemPrompt = buildSystemPrompt(
+      sourceText,
+      paperContext,
+      customGlossary,
+    );
     return `${systemPrompt}\n\n请翻译以下英文医学文献段落：\n\n${sourceText}`;
   }
 
