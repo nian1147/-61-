@@ -156,7 +156,11 @@ const gptTranslate = async function (
   const customPrompt = (getPref(`${prefix}.prompt`) as string) || "";
 
   function buildMedicalMessages(): Array<{ role: string; content: string }> {
-    const systemPrompt = buildSystemPrompt(data.raw, paperContext, customGlossary);
+    const systemPrompt = buildSystemPrompt(
+      data.raw,
+      paperContext,
+      customGlossary,
+    );
     return [
       { role: "system", content: systemPrompt },
       { role: "user", content: `请翻译以下英文医学文献段落：\n\n${data.raw}` },
