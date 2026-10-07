@@ -6,12 +6,12 @@ import {
 
 // ============ 排序后的词汇表 ============
 
-const SORTED_ABBREVIATIONS = Array.from(
-  MEDICAL_ABBREVIATIONS.entries()
-).sort(([a], [b]) => a.toUpperCase().localeCompare(b.toUpperCase()));
+const SORTED_ABBREVIATIONS = Array.from(MEDICAL_ABBREVIATIONS.entries()).sort(
+  ([a], [b]) => a.toUpperCase().localeCompare(b.toUpperCase()),
+);
 
 const SORTED_VOCABULARY = Array.from(MEDICAL_VOCABULARY.entries()).sort(
-  ([a], [b]) => a.localeCompare(b)
+  ([a], [b]) => a.localeCompare(b),
 );
 
 // ============ 缩写分批正则编译 ============
@@ -24,8 +24,8 @@ for (let i = 0; i < SORTED_ABBREVIATIONS.length; i += 500) {
       batch
         .map(([a]) => `\\b${a.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`)
         .join("|"),
-      "gi"
-    )
+      "gi",
+    ),
   );
 }
 
@@ -47,7 +47,7 @@ export function fastScanAbbreviations(searchPool: string): Set<string> {
 
 export function findMatchingAbbreviations(
   sourceText: string,
-  paperContext: string
+  paperContext: string,
 ): Array<[string, [string, string]]> {
   const searchPool = paperContext
     ? sourceText.toUpperCase() + " " + paperContext.toUpperCase()
@@ -77,7 +77,7 @@ function buildWordIndex(text: string): Set<string> {
 
 export function findMatchingVocabulary(
   sourceText: string,
-  paperContext: string
+  paperContext: string,
 ): Array<[string, string]> {
   const searchPool = paperContext
     ? sourceText.toLowerCase() + " " + paperContext.toLowerCase()
@@ -172,7 +172,7 @@ export function getPaperContext(itemId: number | undefined): string {
 export function buildSystemPrompt(
   sourceText: string,
   paperContext: string,
-  customGlossary: Map<string, string>
+  customGlossary: Map<string, string>,
 ): string {
   const matchedAbbrs = findMatchingAbbreviations(sourceText, paperContext);
   const matchedVocab = findMatchingVocabulary(sourceText, paperContext);
@@ -180,15 +180,11 @@ export function buildSystemPrompt(
   let termRef = matchedAbbrs
     .map(([abbr, [fullEn, fullCn]]) => `${abbr}: ${fullEn} -> ${fullCn}`)
     .join("\n");
-  const vocabRef = matchedVocab
-    .map(([en, cn]) => `${en} -> ${cn}`)
-    .join("\n");
+  const vocabRef = matchedVocab.map(([en, cn]) => `${en} -> ${cn}`).join("\n");
 
   if (customGlossary.size > 0) {
     const customRef = Array.from(customGlossary.entries())
-      .filter(
-        ([k]) => k === k.toUpperCase() || k.includes(" ")
-      )
+      .filter(([k]) => k === k.toUpperCase() || k.includes(" "))
       .slice(0, 100)
       .map(([en, cn]) => `${en} -> ${cn}`)
       .join("\n");
@@ -241,7 +237,7 @@ ${contextIntro}
 export function postProcessAbbreviationConsistency(
   resultText: string,
   matchedAbbrs: Array<[string, [string, string]]>,
-  customGlossary: Map<string, string>
+  customGlossary: Map<string, string>,
 ): string {
   let corrected = resultText;
 
@@ -250,27 +246,18 @@ export function postProcessAbbreviationConsistency(
     for (const [en, customCn] of customGlossary) {
       if (en === en.toUpperCase() && en.length <= 10) {
         const escaped = en.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const bracketPattern = new RegExp(
-          `【${escaped}[：:][^】]*】`,
-          "gi"
-        );
-        corrected = corrected.replace(
-          bracketPattern,
-          `【${en}：${customCn}】`
-        );
+        const bracketPattern = new RegExp(`【${escaped}[：:][^】]*】`, "gi");
+        corrected = corrected.replace(bracketPattern, `【${en}：${customCn}】`);
         const barePattern = new RegExp(
           `(?<![A-Za-z])${escaped}[：:]\\s*[\\u4e00-\\u9fff]{2,20}`,
-          "gi"
+          "gi",
         );
         corrected = corrected.replace(barePattern, `${en}：${customCn}`);
       }
       if (en.includes(" ") || en.length > 4) {
         const defaultCn = MEDICAL_VOCABULARY.get(en.toLowerCase());
         if (defaultCn && defaultCn !== customCn) {
-          const escaped = defaultCn.replace(
-            /[.*+?^${}()|[\]\\]/g,
-            "\\$&"
-          );
+          const escaped = defaultCn.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           corrected = corrected.replace(new RegExp(escaped, "g"), customCn);
         }
       }
@@ -280,29 +267,23 @@ export function postProcessAbbreviationConsistency(
   // 2. 缩写一致性检查
   const corrections: string[] = [];
   for (const [abbr, [fullEn, standardCn]] of matchedAbbrs) {
-    if (
-      customGlossary.has(abbr) ||
-      customGlossary.has(abbr.toLowerCase())
-    )
+    if (customGlossary.has(abbr) || customGlossary.has(abbr.toLowerCase()))
       continue;
     const abbrEscaped = abbr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = new RegExp(
       `${abbrEscaped}([\\s\\S]{0,80}?)([\\u4e00-\\u9fff]{2,20})`,
-      "gi"
+      "gi",
     );
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(corrected)) !== null) {
       const foundChinese = match[2];
-      if (
-        foundChinese !== standardCn &&
-        !foundChinese.includes(standardCn)
-      ) {
+      if (foundChinese !== standardCn && !foundChinese.includes(standardCn)) {
         const isReasonable =
           standardCn.includes(foundChinese) ||
           foundChinese.includes(standardCn);
         if (!isReasonable) {
           corrections.push(
-            `${abbr}：AI 译为「${foundChinese}」，词库标准译名为「${standardCn}」`
+            `${abbr}：AI 译为「${foundChinese}」，词库标准译名为「${standardCn}」`,
           );
         }
       }
@@ -348,12 +329,12 @@ function loadCache(): Map<string, { result: string; timestamp: number }> {
 }
 
 export function saveCache(
-  cache: Map<string, { result: string; timestamp: number }>
+  cache: Map<string, { result: string; timestamp: number }>,
 ) {
   try {
     if (cache.size > MAX_CACHE_ENTRIES) {
       const sorted = [...cache.entries()].sort(
-        ([, a], [, b]) => a.timestamp - b.timestamp
+        ([, a], [, b]) => a.timestamp - b.timestamp,
       );
       for (const [k] of sorted.slice(0, cache.size - MAX_CACHE_ENTRIES)) {
         cache.delete(k);
